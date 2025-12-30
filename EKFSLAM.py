@@ -1,299 +1,210 @@
 import numpy as np
 from rich import print
 from timeit import default_timer as timer
-import copy
 
 
+# ------------------------------------------------------------
+# Utility: compute difference between two angles in [-pi, pi)
+# ------------------------------------------------------------
 def difference_angle(angle1, angle2):
-    difference = (angle1 - angle2) % (2*np.pi)
-    difference = np.where(difference > np.pi, difference - 2*np.pi, difference)
-    difference = difference.item() # we want to convert 0-d array to float
+    diff = (angle1 - angle2) % (2 * np.pi)
+    if diff > np.pi:
+        diff -= 2 * np.pi
+    return float(diff)
 
-    return difference
 
+# ============================================================
+# EKF SLAM CLASS
+# ============================================================
 class EKFSLAM:
     def __init__(self,
         WHEEL_RADIUS,
         WIDTH,
-
         MOTOR_STD,
         DIST_STD,
         ANGLE_STD,
-
-        init_state: np.ndarray = np.zeros(3),
-        init_covariance: np.ndarray = np.zeros((3,3))
+        init_state=np.zeros(3),
+        init_covariance=np.zeros((3, 3))
     ):
+        # Robot parameters
         self.WHEEL_RADIUS = WHEEL_RADIUS
         self.WIDTH = WIDTH
 
-        self.mu = init_state.copy()
+        # EKF state mean and covariance
+        self.mu = init_state.copy()                  # [x, y, theta, x1, y1, ...]
         self.Sigma = init_covariance.copy()
-        self.ids = np.full((1000,), -1) # create an array instead of a list
-        self.ids_index = np.full((2000,), -1) # lookup table to get index of id # assume, no ids larger than 2000
-        self.num_ids = 0
-        
 
+        # Landmark bookkeeping
+        self.ids = np.full(1000, -1)
+        self.ids_index = np.full(2000, -1)
+        self.num_ids = 0
+        self.num_times_seen_landmark = {}
+
+        # Measurement noise
         self.DIST_STD = DIST_STD
         self.ANGLE_STD = np.radians(ANGLE_STD)
 
+        # Motion noise (wheel encoder noise)
         self.error_l = np.radians(MOTOR_STD) * WHEEL_RADIUS * np.sqrt(2)
         self.error_r = np.radians(MOTOR_STD) * WHEEL_RADIUS * np.sqrt(2)
 
-        self.num_times_seen_landmark = {}
 
-        return
-
+    # ========================================================
+    # PREDICTION STEP
+    # ========================================================
     def predict(self, l, r):
         time1 = timer()
 
-        x, y, theta, std = self.get_robot_pose()
-
-        # motion model: inputs l and r are wheel displacements (linear), same units as WHEEL_RADIUS * radians
+        x, y, theta = self.mu[:3]
         alpha = (r - l) / self.WIDTH
 
-        def motion(x, y, theta, l_in, r_in):
-            # returns new pose given current pose and wheel displacements
-            if abs(r_in - l_in) >= np.radians(1) * self.WHEEL_RADIUS:
-                alpha_local = (r_in - l_in) / self.WIDTH
-                R = l_in / alpha_local
-                x_new = x + (R + self.WIDTH/2.0) * (np.sin(theta + alpha_local) - np.sin(theta))
-                y_new = y + (R + self.WIDTH/2.0) * (-np.cos(theta + alpha_local) + np.cos(theta))
-                theta_new = theta + alpha_local
-            else:
-                # straight-ish motion
-                x_new = x + l_in * np.cos(theta)
-                y_new = y + l_in * np.sin(theta)
-                theta_new = theta
-            # normalize theta
-            theta_new = (theta_new + np.pi) % (2*np.pi) - np.pi
-            return x_new, y_new, theta_new
+        # ----------------------------------------------------
+        # Case 1: Turning motion
+        # ----------------------------------------------------
+        if abs(r - l) > np.radians(1) * self.WHEEL_RADIUS:
+            theta_old = theta
+            R = l / alpha
 
-        # compute new pose
-        x_new, y_new, theta_new = motion(x, y, theta, l, r)
+            # Motion model
+            x += (R + self.WIDTH / 2) * (np.sin(theta_old + alpha) - np.sin(theta_old))
+            y += (R + self.WIDTH / 2) * (-np.cos(theta_old + alpha) + np.cos(theta_old))
+            theta += alpha
 
-        # compute Jacobians numerically (finite differences) for robustness and simplicity
-        eps = 1e-6
-        # Jacobian wrt state (x,y,theta)
-        G = np.zeros((3,3))
-        f0 = np.array([x_new, y_new, theta_new])
-        # perturb x
-        fx = motion(x+eps, y, theta, l, r)
-        fy = motion(x, y+eps, theta, l, r)
-        ft = motion(x, y, theta+eps, l, r)
-        G[:,0] = (np.array(fx) - f0) / eps
-        G[:,1] = (np.array(fy) - f0) / eps
-        G[:,2] = (np.array(ft) - f0) / eps
+            # Normalize orientation
+            theta = (theta + np.pi) % (2 * np.pi) - np.pi
 
-        # Jacobian wrt control (l, r)
-        V = np.zeros((3,2))
-        flp = motion(x, y, theta, l+eps, r)
-        frp = motion(x, y, theta, l, r+eps)
-        V[:,0] = (np.array(flp) - f0) / eps
-        V[:,1] = (np.array(frp) - f0) / eps
+            # Jacobian wrt state
+            G = np.array([
+                [1, 0, (R + self.WIDTH / 2) * (np.cos(theta_old + alpha) - np.cos(theta_old))],
+                [0, 1, (R + self.WIDTH / 2) * (np.sin(theta_old + alpha) - np.sin(theta_old))],
+                [0, 0, 1]
+            ])
 
-        # update mu
-        self.mu[:3] = x_new, y_new, theta_new
+            # Jacobian wrt control (from PDF)
+            A = (self.WIDTH * r) / ((r - l)**2) * (np.sin(theta_old + alpha) - np.sin(theta_old)) \
+                - (r + l) / (2 * (r - l)) * np.cos(theta_old + alpha)
 
-        # build full G for state dimension
+            B = (self.WIDTH * r) / ((r - l)**2) * (-np.cos(theta_old + alpha) + np.cos(theta_old)) \
+                - (r + l) / (2 * (r - l)) * np.sin(theta_old + alpha)
+
+            C = -(self.WIDTH * l) / ((r - l)**2) * (np.sin(theta_old + alpha) - np.sin(theta_old)) \
+                + (r + l) / (2 * (r - l)) * np.cos(theta_old + alpha)
+
+            D = -(self.WIDTH * l) / ((r - l)**2) * (-np.cos(theta_old + alpha) + np.cos(theta_old)) \
+                + (r + l) / (2 * (r - l)) * np.sin(theta_old + alpha)
+
+        # ----------------------------------------------------
+        # Case 2: Straight motion
+        # ----------------------------------------------------
+        else:
+            theta_old = theta
+            x += l * np.cos(theta_old)
+            y += l * np.sin(theta_old)
+
+            G = np.array([
+                [1, 0, -l * np.sin(theta_old)],
+                [0, 1,  l * np.cos(theta_old)],
+                [0, 0, 1]
+            ])
+
+            A = 0.5 * (np.cos(theta_old) + (l / self.WIDTH) * np.sin(theta_old))
+            B = 0.5 * (np.sin(theta_old) - (l / self.WIDTH) * np.cos(theta_old))
+            C = 0.5 * (np.cos(theta_old) - (l / self.WIDTH) * np.sin(theta_old))
+            D = 0.5 * (np.sin(theta_old) + (l / self.WIDTH) * np.cos(theta_old))
+
+        # Control Jacobian
+        V = np.array([[A, C], [B, D], [-1 / self.WIDTH, 1 / self.WIDTH]])
+
+        # Expand Jacobians if landmarks exist
         N = self.num_ids
         if N > 0:
-            G_full = np.block([[G, np.zeros((3,2*N))], [np.zeros((2*N,3)), np.identity(2*N)]])
-            V_full = np.vstack((V, np.zeros((2*N,2))))
-        else:
-            G_full = G
-            V_full = V
+            G = np.block([[G, np.zeros((3, 2 * N))],
+                          [np.zeros((2 * N, 3)), np.eye(2 * N)]])
+            V = np.vstack([V, np.zeros((2 * N, 2))])
 
-        # motion noise (control noise covariance)
-        diag = np.diag(np.array([np.power(self.error_l,2), np.power(self.error_r,2)]))
+        # Update mean and covariance
+        self.mu[:3] = x, y, theta
+        Q = np.diag([self.error_l**2, self.error_r**2])
+        self.Sigma = G @ self.Sigma @ G.T + V @ Q @ V.T
 
-        # propagate covariance
-        self.Sigma = G_full @ self.Sigma @ G_full.T + V_full @ diag @ V_full.T
+        # Sanity check
+        assert np.all(np.isfinite(self.mu))
+        assert np.all(np.isfinite(self.Sigma))
 
-        elapsed_time = timer() - time1
-        if elapsed_time > 0.1:
-            print(f"[red]EKF_SLAM predict time: {elapsed_time}")
+        if timer() - time1 > 0.1:
+            print("[red]EKF predict slow")
 
-    def add_landmark(self, position: tuple, measurement: tuple, id: int):
+
+    # ========================================================
+    # ADD LANDMARK
+    # ========================================================
+    def add_landmark(self, position, id):
         x, y = position
-        # add with variance of 100m
-        x_var = float(100)
-        y_var = float(100)
 
-        self.mu = np.append(self.mu, [x,y])
+        self.mu = np.append(self.mu, [x, y])
         self.Sigma = np.block([
             [self.Sigma, np.zeros((self.Sigma.shape[0], 2))],
-            [np.zeros((2, self.Sigma.shape[1])), np.diag(np.array([x_var, y_var]))]
+            [np.zeros((2, self.Sigma.shape[1])), np.diag([100.0, 100.0])]
         ])
 
-        # add the id to the array
         self.ids[self.num_ids] = id
         self.ids_index[id] = self.num_ids
         self.num_ids += 1
-
         self.num_times_seen_landmark[id] = 1
 
 
-    def correction(self, landmark_position_measured: tuple, id: int, count=True):
-        time1 = timer()
-
-        r_meas, alpha_meas = landmark_position_measured
-
-        N = self.num_ids
+    # ========================================================
+    # CORRECTION STEP
+    # ========================================================
+    def correction(self, measurement, id):
+        r_meas, alpha_meas = measurement
         i = self.ids_index[id]
 
-        x_lm, y_lm = self.mu[3+2*i : 3+2*(i+1)]
-        # x_bot, y_bot, theta_bot, stdev_bot = self.get_robot_pose()
-        x_bot,y_bot,theta_bot = self.mu[:3].copy()
+        x, y, theta = self.mu[:3]
+        xm, ym = self.mu[3 + 2*i : 3 + 2*i + 2]
 
-        dx = x_lm - x_bot
-        dy = y_lm - y_bot
-
+        dx = xm - x
+        dy = ym - y
         r2 = dx**2 + dy**2
-        r = np.sqrt(r2)
-        alpha = np.arctan2(dy,dx) - theta_bot
+        r = max(np.sqrt(r2), 1e-6)
 
-        H_small = np.zeros((2,5))
-        H_small[0,:3] = np.array([-dx / r, -dy / r, 0])
-        H_small[1,:3] = np.array([dy / r**2, -dx / r**2, -1])
+        alpha = np.arctan2(dy, dx) - theta
 
-        H_small[0,3 : 5] = np.array([dx / r, dy / r])
-        H_small[1,3 : 5] = np.array([-dy / r**2, dx / r**2])
-
-        H = np.zeros((2,3+2*N))
-        H[0,:3] = np.array([-dx / r, -dy / r, 0])
-        H[1,:3] = np.array([dy / r2, -dx / r2, -1])
-
-        H[0,3+2*i : 3+2*(i+1)] = np.array([dx / r, dy / r])
-        H[1,3+2*i : 3+2*(i+1)] = np.array([-dy / r2, dx / r2])
-
-        sigma_small = np.zeros((5, 5))
-
-        sigma_small[:3, :3] = self.Sigma[:3, :3]
-        sigma_small[3:5, 3:5] = self.Sigma[3+2*i : 3+2*(i+1), 3+2*i : 3+2*(i+1)]
-
-        # cross-variances
-        sigma_small[3:5, 0:3] = self.Sigma[3+2*i : 3+2*(i+1), 0:3]
-        sigma_small[0:3, 3:5] = self.Sigma[0:3, 3+2*i : 3+2*(i+1)]
-
-        # ===== implement measurement update =====
-        Q = np.diag([self.DIST_STD**2, self.ANGLE_STD**2])
-
-        # innovation (measured - predicted). Keep angles handled by difference_angle
-        diff_in_angle = difference_angle(alpha_meas, alpha)
-        diff_in_r = r_meas - r
-
-        Z = np.array([diff_in_r, diff_in_angle])
-
-        S = H @ self.Sigma @ H.T + Q
-        K = self.Sigma @ H.T @ np.linalg.inv(S)
-
-        # apply correction
-        correction = K @ Z
-
-        self.mu += correction
-
-        self.Sigma = (np.identity(3+2*N) - K @ H) @ self.Sigma
-
-        elapsed_time = timer() - time1
-        if elapsed_time > 0.1:
-            print(f"[red]EKF_SLAM correction time: {elapsed_time}")
-
-        # count how many times we have found it
-        if count:
-            self.num_times_seen_landmark[id] += 1
-
-
-    def get_robot_pose(self):
-        x,y,theta = self.mu[:3]
-        sigma = self.Sigma[:2, :2]
-        error = self.get_error_ellipse(sigma)
-
-        return x, y, theta, error
-
-    def get_landmark_poses(self, at_least_seen_num=2):
-        positions = self.mu[3:].copy()
-        positions = positions.reshape((len(positions) // 2, 2))
-
-        errors = []
-        for i in np.arange(self.num_ids):
-            j = 3 + 2 * i
-            sigma_i = self.Sigma[j:j+2, j:j+2]
-
-            errors.append(self.get_error_ellipse(sigma_i))
-
-        if at_least_seen_num == 0 or at_least_seen_num == 1:
-            return positions, np.array(errors), np.array(self.ids[:self.num_ids])
-        else:
-            # only return landmarks that have been seen at least twice
-            mask = np.zeros(self.num_ids, dtype=bool)
-            for i, id in enumerate(self.ids):
-                if id == -1:
-                    break
-                if self.num_times_seen_landmark[id] >= at_least_seen_num:
-                    mask[i] = 1
-
-            return positions[mask], np.array(errors)[mask], np.array(self.ids[:self.num_ids])[mask]
-
-
-    def get_landmark_pose(self, id):
-        i = self.ids_index[id]
-        positions = self.mu[3:]
-
-        j = 3 + 2 * i
-        sigma_i = self.Sigma[j:j+2, j:j+2]
-
-        return positions[i*2:i*2 + 2], self.get_error_ellipse(sigma_i)
-
-
-
-    def get_error_ellipse(self, covariance):
-        all_zeros = not np.any(covariance)
-        if all_zeros:
-            return 0, 0, 0
-        else:
-            eigen_vals, eigen_vecs = np.linalg.eig(covariance)
-
-            # angle of first (largest) eigenvector
-            angle = np.arctan2(eigen_vecs[1, 0], eigen_vecs[0, 0])
-
-        return np.sqrt(eigen_vals[0]), np.sqrt(eigen_vals[1]), angle
-
-
-    def get_landmark_ids(self):
-        return np.array(self.ids[:self.num_ids])
-
-    def remove_blocks(self):
-        for landmark_id in self.ids:
-            if landmark_id > -1 and landmark_id >= 1000:
-                self.remove_by_id(landmark_id)
-                
-
-    def remove_by_id(self, landmark_id):
-
-        print("[red]removing landmark ", landmark_id)
-
-        # get index
-        i = self.ids_index[landmark_id]
-
-        self.ids = np.delete(self.ids, i) # same as pop
-
-        # recreate index array
-        self.ids_index[landmark_id] = -1
-        for an_idx, an_id in enumerate(self.ids):
-            if an_id == -1:
-                break
-
-            self.ids_index[an_id] = an_idx
-
-        del self.num_times_seen_landmark[landmark_id]
-
-        self.num_ids -= 1
-
-        # remove the block from mu
-        self.mu = np.hstack((self.mu[:3+2*i], self.mu[3+2*(i+1):]))
-
-        # we remove the row and column corresponding to the 2x2 Sigma block
-        self.Sigma = np.block([
-            [self.Sigma[:3+2*i, :3+2*i], self.Sigma[:3+2*i, 3+2*(i+1):]],
-            [self.Sigma[3+2*(i+1):, :3+2*i], self.Sigma[3+2*(i+1):, 3+2*(i+1):]]
+        # Reduced Jacobian
+        Hs = np.array([
+            [-dx / r, -dy / r, 0,  dx / r,  dy / r],
+            [ dy / r2, -dx / r2, -1, -dy / r2, dx / r2]
         ])
+
+        # Reduced covariance
+        Sigma_s = np.zeros((5, 5))
+        Sigma_s[:3, :3] = self.Sigma[:3, :3]
+        Sigma_s[3:, 3:] = self.Sigma[3 + 2*i : 3 + 2*i + 2,
+                                     3 + 2*i : 3 + 2*i + 2]
+        Sigma_s[:3, 3:] = self.Sigma[:3, 3 + 2*i : 3 + 2*i + 2]
+        Sigma_s[3:, :3] = self.Sigma[3 + 2*i : 3 + 2*i + 2, :3]
+
+        Q = np.diag([self.DIST_STD**2, self.ANGLE_STD**2])
+        S_inv = np.linalg.inv(Hs @ Sigma_s @ Hs.T + Q)
+
+        # Full H
+        H = np.zeros((2, len(self.mu)))
+        H[:, :3] = Hs[:, :3]
+        H[:, 3 + 2*i : 3 + 2*i + 2] = Hs[:, 3:]
+
+        # Kalman gain
+        K = self.Sigma @ H.T @ S_inv
+
+        # Innovation
+        innovation = np.array([
+            r_meas - r,
+            difference_angle(alpha_meas, alpha)
+        ])
+
+        # Update
+        self.mu += K @ innovation
+        self.mu[2] = (self.mu[2] + np.pi) % (2 * np.pi) - np.pi
+        self.Sigma = (np.eye(len(self.mu)) - K @ H) @ self.Sigma
+
+        assert np.all(np.isfinite(self.mu))
+        assert np.all(np.isfinite(self.Sigma))
