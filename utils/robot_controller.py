@@ -63,7 +63,6 @@ class RobotController:
             )
 
             print("[green]***CONNECTED TO REAL VEHICLE***[/green]")
-
         else:
             print("[red]***USING Dummy VEHICLE***[/red]")
             self.vehicle = DummyVehicle()
@@ -166,36 +165,13 @@ class RobotController:
         self.vehicle.move(speed, turn)
         self.recorder.save_step(img, speed, turn)
 
-
     def get_motor_movement(self) -> tuple:
-        """
-        Returns ABSOLUTE wheel travel distances (left, right) in METERS.
-        """
-        if not self.vehicle:
-            return 0.0, 0.0
-
-        try:
-            # ev3_dc TwoWheelVehicle provides motor_pos = (left_deg, right_deg)
-            l_deg, r_deg = self.vehicle.motor_pos
-
-            # degrees → radians
-            l_rad = np.deg2rad(l_deg)
-            r_rad = np.deg2rad(r_deg)
-
-            # radians → meters
-            l_m = l_rad * self.slam.WHEEL_RADIUS
-            r_m = r_rad * self.slam.WHEEL_RADIUS
-
-            return l_m, r_m
-
-        except Exception as e:
-            print(f"[red]Motor read failed: {e}[/red]")
-            return 0.0, 0.0
-
-        except Exception as e:
-            print(f"[red]Error reading motors: {e}[/red]")
-            return (0.0, 0.0)
-
+        ### Your code here ###
+        pass
+        l = 0
+        r = 0
+        ###
+        return (l, r)
 
     def run_ekf_slam(self, img, draw_img=None):
         # movements is what is refered to as u = (l, r) in the document
@@ -209,7 +185,7 @@ class RobotController:
 
         robot_x, robot_y, robot_theta, robot_stdev = self.slam.get_robot_pose()
         landmark_estimated_ids = self.slam.get_landmark_ids()
-        landmark_estimated_positions, landmark_estimated_stdevs, landmark_estimated_ids = self.slam.get_landmark_poses()
+        landmark_estimated_positions, landmark_estimated_stdevs = self.slam.get_landmark_poses()
 
         
         for i, id in enumerate(ids):
