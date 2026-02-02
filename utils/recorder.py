@@ -4,7 +4,7 @@ import numpy as np
 from rich import print
 import json
 import natsort
-
+import time
 
 class Recorder:
     def __init__(self, dt) -> None:
@@ -22,8 +22,7 @@ class Recorder:
 
         output = ""
         with open(os.path.join(recording_path, "movement.json"), "r+") as f:
-            output = json.load(f)
-
+            output = json.load(f)   
         img_paths = os.listdir(recording_path)
         img_paths = natsort.os_sorted(img_paths)
 
@@ -36,8 +35,12 @@ class Recorder:
         if len(imgs) != len(output):
             print("[red]load recording failed! num images doesn't match!")
 
-        for img, (speed, turn, x, y, theta, l, r) in zip(imgs, output):
-            self.recording.append((img, speed, turn, x, y, theta, l, r))
+        if True: #len(output[0]) == 7:
+            for img, (speed, turn, x, y, theta, l, r) in zip(imgs, output):
+                self.recording.append((img, speed, turn, x, y, theta, l, r))
+        else:
+            for img, (speed, turn, x, y, theta, l, r, time) in zip(imgs, output):
+                self.recording.append((img, speed, turn, x, y, theta, l, r, time))
 
         self.playback = True
         self.get_step = self._get_step()
@@ -51,15 +54,15 @@ class Recorder:
         
         os.makedirs(dir_name)
         # save speed, turn
-        movements = [[speed, turn, np.round(x,3), np.round(y,3), np.round(theta, 3), np.round(l,3), np.round(r, 3)] for (_, speed, turn, x, y, theta, l, r) in self.recording]
+        movements = [[speed, turn, np.round(x,3), np.round(y,3), np.round(theta, 3), np.round(l,3), np.round(r, 3)] for (_, speed, turn, x, y, theta, l, r, time) in self.recording]
         json_object = json.dumps(movements, indent=2)
         with open(os.path.join(dir_name, "movement.json"), "w") as f:
                 f.write(json_object)
 
-        for idx, (img, _, _, _, _, _, _, _) in enumerate(self.recording):
+        for idx, (img, _, _, _, _, _, _, _, _) in enumerate(self.recording):
             img_filename = os.path.join(dir_name, f"img_{idx}.jpg")
             cv2.imwrite(img_filename, img)
-        
+
         # TODO: save dt as well
 
         print("[green]Finished saving!")
@@ -75,7 +78,7 @@ class Recorder:
 
     def save_step(self, img, speed, turn, x=0, y=0, theta=0, l=0, r=0):
         if self.is_recording:
-            self.recording.append((img, speed, turn, x, y, theta, l, r))
+            self.recording.append((img, speed, turn, x, y, theta, l, r, time.time()))
 
     def _get_step(self):
         # TODO: implement generator

@@ -52,6 +52,16 @@ class Vision:
             self.rotation_camera_robot, 
             self.offset_camera_robot
         )
+
+    def calculate_distance_and_heading(current_pose, goal_position):
+        """Calculate distance and heading to goal"""
+        x, y, theta, _ = current_pose
+        dx = goal_position[0] - x
+        dy = goal_position[1] - y
+        distance = np.sqrt(dx**2 + dy**2)
+        desired_heading = np.arctan2(dy, dx)
+        heading_error = difference_angle(desired_heading, theta)
+        return distance, heading_error
     
     def _rotation_matrix(self, x_rotation, y_rotation, z_rotation):
         """Create rotation matrix from Euler angles (intrinsic ZYX order)"""

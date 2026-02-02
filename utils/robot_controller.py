@@ -12,6 +12,8 @@ from utils.robot_dummy import DummyVehicle
 
 from timeit import default_timer as timer
 
+from utils.navigation import NavigationController, WaypointNavigator # new navigation classes, might work well or need some tuning later (config.yaml) - j
+
 
 class RobotController:
     def __init__(self, config) -> None:
@@ -39,6 +41,103 @@ class RobotController:
 
         self.detected_ids = set()
 
+    def drive_to_point(self, goal_position, timeout=30, img=None):
+        """
+        Drive to a specific world coordinate point
+        
+        Args:
+            goal_position: (x, y) tuple in world coordinates
+            timeout: Maximum time in seconds
+            img: Optional image for visualization
+            
+        Returns:
+            bool: True if goal reached, False if timeout
+        """
+        print(f"[RobotController] Driving to point: {goal_position}")
+        
+        self.navigator.set_goal(goal_position)
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Get current image if not provided
+            if img is None:
+                raw_img = self.camera.capture()
+                img_copy = raw_img.copy()
+            else:
+                raw_img = img
+                img_copy = img.copy()
+            
+            # Update SLAM
+            data = self.run_ekf_slam(raw_img, img_copy)
+            
+            # Get current pose
+            robot_pose = self.slam.get_robot_pose()
+            
+            # Compute navigation controls
+            speed, turn = self.navigator.compute_controls(robot_pose)
+            
+            # Apply controls
+            self.move(speed, turn, img=img_copy)
+            
+            # Check if goal reached
+            if self.navigator.goal_reached:
+                self.move(0, 0)  # Stop
+                return True
+            
+            # Small delay for control loop
+            time.sleep(0.05)
+            
+        print(f"[RobotController] Timeout reached for goal {goal_position}")
+        self.move(0, 0)  # Stop
+        return False
+    
+    def follow_waypoints(self, waypoints, timeout_per_waypoint=10):
+        """
+        Follow a sequence of waypoints
+        
+        Args:
+            waypoints: List of (x, y) tuples
+            timeout_per_waypoint: Timeout for each waypoint
+            
+        Returns:
+            bool: True if all waypoints reached, False otherwise
+        """
+        print(f"[RobotController] Following {len(waypoints)} waypoints")
+        
+        self.waypoint_navigator.set_waypoints(waypoints)
+        all_complete = False
+        
+        while not all_complete:
+            # Capture image
+            raw_img = self.camera.capture()
+            img_copy = raw_img.copy()
+            
+            # Update SLAM
+            data = self.run_ekf_slam(raw_img, img_copy)
+            
+            # Get current pose
+            robot_pose = self.slam.get_robot_pose()
+            
+            # Update waypoint navigation
+            speed, turn, waypoint_complete, all_complete = \
+                self.waypoint_navigator.update(robot_pose)
+            
+            # Apply controls
+            self.move(speed, turn, img=img_copy)
+            
+            if waypoint_complete and not all_complete:
+                print(f"[RobotController] Waypoint reached, moving to next")
+                time.sleep(0.5)  # Pause briefly between waypoints
+            
+            time.sleep(0.05)
+            
+        print("[RobotController] All waypoints completed")
+        return True
+    
+    def get_navigation_status(self):
+        """Get current navigation status"""
+        return self.navigator.get_navigation_status()
+
 
     def __enter__(self) -> RobotController:
         # Called on start up
@@ -61,7 +160,6 @@ class RobotController:
                 speed = 10,
                 ev3_obj=self.__ev3_obj__
             )
-
             print("[green]***CONNECTED TO REAL VEHICLE***[/green]")
         else:
             print("[red]***USING Dummy VEHICLE***[/red]")
@@ -114,7 +212,7 @@ class RobotController:
         v = np.clip(v_max * speed / 100, -1 * v_max, v_max)
         w = np.clip(w_max * turn / 100, -1 * w_max, w_max)
         if speed == 0 and turn == 0:
-            self.vehicle.stop()
+            self.vehicle.stop(brake=True)
             return
         if w == 0:
             vl = v
@@ -167,11 +265,12 @@ class RobotController:
 
     def get_motor_movement(self) -> tuple:
         ### Your code here ###
-        pass
-        l = 0
-        r = 0
-        ###
-        return (l, r)
+        mp = self.vehicle.motor_pos
+        print(f"L: {mp.left:7d} deg | R: {mp.right:7d} deg") # each is a 32 bit signed integer representing degrees turned - ~2147483647 deg max ~ 6 million rotations - a distance of about 800 km for 0.045 m diameter wheels - if we drive this far, something is wrong
+        distance_left = mp.left * (2 * np.pi * self.slam.WHEEL_RADIUS) / 360
+        distance_right = mp.right * (2 * np.pi * self.slam.WHEEL_RADIUS) / 360
+
+        return (distance_left, distance_right)
 
     def run_ekf_slam(self, img, draw_img=None):
         # movements is what is refered to as u = (l, r) in the document
@@ -183,20 +282,26 @@ class RobotController:
 
         ids, landmark_rs, landmark_alphas, landmark_positions = self.vision.detections(img, draw_img, self.slam.get_robot_pose())
 
+        if self.slam.position_is_initialized == False:
+            # get current robot pose based on the observed landmarks and those already in the map
+            self.slam.initialize_position((landmark_rs, landmark_alphas), ids)
+            self.slam.position_is_initialized = True
+
         robot_x, robot_y, robot_theta, robot_stdev = self.slam.get_robot_pose()
         landmark_estimated_ids = self.slam.get_landmark_ids()
-        landmark_estimated_positions, landmark_estimated_stdevs = self.slam.get_landmark_poses()
+        landmark_estimated_positions, landmark_estimated_stdevs, landmark_estimated_ids = self.slam.get_landmark_poses()
 
         
         for i, id in enumerate(ids):
             if id not in self.slam.get_landmark_ids():
                 self.slam.add_landmark(landmark_positions[i], (landmark_rs[i], landmark_alphas[i]), id)
-                print(f"Landmark with id {id} added")
+                print(f"Landmark with id {id} added at {landmark_positions[i][0]*100:.1f}cm, {landmark_positions[i][1]*100:.1f}cm")
             else:
                 # correct each detected landmark that is already added
                 self.slam.correction((landmark_rs[i], landmark_alphas[i]), id)
 
         data = SimpleNamespace()
+        print(f"{landmark_positions}")
         data.landmark_ids = ids
         data.landmark_rs = landmark_rs
         data.landmark_alphas = landmark_alphas

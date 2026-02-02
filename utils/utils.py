@@ -14,6 +14,21 @@ class boundary(Enum):
     inner = 0
     outer = 2
 
+def difference_angle(angle1, angle2, is_degrees=False):
+    """
+    Computes the difference between two angles in radians,
+    taking into account the circular nature of angles.
+    The result is in the range [-pi, pi].
+    """
+    if is_degrees:
+        angle1 = np.deg2rad(angle1)
+        angle2 = np.deg2rad(angle2)
+    diff = angle2 - angle1
+    while diff < -np.pi:
+        diff += 2 * np.pi
+    while diff > np.pi:
+        diff -= 2 * np.pi
+    return diff
 
 def load_config(filepath="./config.yaml"):
     if os.path.isfile(filepath):
